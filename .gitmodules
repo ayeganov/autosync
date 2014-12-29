@@ -1,0 +1,3 @@
+[submodule "lib/async_zmq"]
+	path = lib/async_zmq
+	url = git@github.com:ayeganov/async_zmq.git
