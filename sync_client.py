@@ -65,7 +65,8 @@ class SyncClient:
             self._loop.stop()
             return
 
-        event_mask = functools.reduce(lambda x, y: EVENTS_MAP[x] | EVENTS_MAP[y], events)
+        event_vals = (EVENTS_MAP[e] for e in events)
+        event_mask = functools.reduce(lambda mask, cur: mask | cur, event_vals)
         new_path_msg = {
             "sync_from" : sync_from,
             "sync_to" : sync_to,
