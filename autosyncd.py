@@ -2,12 +2,8 @@ import abc
 import asyncio
 import functools
 import grp
-import lockfile
+#import lockfile
 import logging
-#logging.basicConfig()
-#                    format='%(asctime)s %(message)s',
-#                    level=logging.INFO)
-
 import os
 import pickle
 import re
@@ -218,19 +214,21 @@ class EventSink:
         @param event - a pyinotify event indicating file read, write, or
                        creation etc.
         '''
+        log.debug("File event: {0}".format(event.pathname))
         filename = os.path.basename(event.pathname)
         if self._file_excluder.is_excluded(filename):
             return
 
-        log.debug("File event: {0}".format(filename))
         binding_events = self._events.setdefault(binding, set())
-        binding_events.add(filename + '\n')
+        binding_events.add(event.pathname + '\n')
 
         # In case number of files that changed has exceeded the threshold
         # schedule a sync of this sync binding
         if len(binding_events) >= EventSink.SYNC_THRESHOLD:
             popped_events = self.pop_events(binding)
             asyncio.async(self._auto_sync._synchronize(binding, popped_events))
+        else:
+            self._auto_sync.schedule_sync()
 
     @property
     def all_events(self):
@@ -239,13 +237,6 @@ class EventSink:
         dictionary.
         '''
         return self._events
-
-    @property
-    def all_bindings(self):
-        '''
-        All bindings event sink is aware of.
-        '''
-        return [binding for binding in self._events.keys()]
 
     def pop_events(self, binding):
         '''
@@ -273,7 +264,18 @@ class AutoSync:
         self._notifier = pyinotify.AsyncioNotifier(self._wm, self._loop)
         excluder = FileExcluder(AutoSync.CONFIG_PATH)
         self._event_sink = EventSink(self, excluder, loop)
-        self._sync_handle = self._loop.call_later(1, self._do_sync)
+        self._sync_handle = None
+        self._bindings = {}
+
+    def schedule_sync(self, delay=1.0):
+        '''
+        Schedules a call to do_sync to be run in delay seconds. If one is
+        already scheduled it is a no-op.
+
+        @param delay - how long to wait before syncing
+        '''
+        if self._sync_handle is None:
+            self._sync_handle = self._loop.call_later(delay, self._do_sync)
 
     def add_sync_binding(self, sync_from, sync_to, host, events):
         '''
@@ -285,8 +287,16 @@ class AutoSync:
         @param host - server on which sync_to is located
         @param events - set of events which trigger this syncher
         '''
+        def make_canonical(path):
+            if path[-1] != '/':
+                path += '/'
+            return path
+
         if not os.path.isdir(sync_from):
             raise ValueError("Sync from parameter must be a directory.")
+
+        # apply canonical form of directory path
+        sync_from = make_canonical(sync_from)
 
         if host is not None:
             binding = Binding.make_remote(sync_from, sync_to, host)
@@ -296,9 +306,12 @@ class AutoSync:
         log.debug("Adding sync binding: {0}".format(binding))
 
         partial_sink = functools.partial(self._event_sink.sink, binding)
-        self._wm.add_watch(sync_from,
-                           events,
-                           proc_fun=partial_sink)
+        self._bindings[binding] = self._wm.add_watch(sync_from,
+                                                     events,
+                                                     proc_fun=partial_sink,
+                                                     rec=True,
+                                                     auto_add=True)
+        log.debug("Current bindings: %s", self._bindings)
 
     def _do_sync(self):
         '''
@@ -307,12 +320,12 @@ class AutoSync:
         not be called directly.
         '''
         log.debug("Performing full synchronization...")
-        for binding in self._event_sink.all_bindings:
+        for binding in self._bindings.keys():
             file_events = self._event_sink.pop_events(binding)
-            asyncio.async(self._synchronize(binding, file_events))
+            if file_events is not None:
+                asyncio.async(self._synchronize(binding, file_events))
 
-        # Reschedule self
-        self._sync_handle = self._loop.call_later(1, self._do_sync)
+        self._sync_handle = None
 
     @asyncio.coroutine
     def _synchronize(self, binding, changed_files):
@@ -331,8 +344,18 @@ class AutoSync:
                                                 stdout=asyncio.subprocess.PIPE)
         proc = yield from create
 
-        encoded_files = (v.encode() for v in changed_files)
-#        proc.stdin.write(filename.encode())
+        def sanitize_path(root, sub_path):
+            '''
+            Removes the root directory from sub_path, as in:
+                root: /tmp/source
+                sub_path: /tmp/source/dir/file
+                result: dir/file
+            Applies utf-8 encoding to the resultant string.
+            '''
+            clean_path = sub_path.split(root)[1]
+            return clean_path.encode()
+
+        encoded_files = (sanitize_path(binding.source, v) for v in changed_files)
         proc.stdin.writelines(encoded_files)
         yield from proc.stdin.drain()
         proc.stdin.write_eof()
@@ -400,7 +423,7 @@ def main():
     loop = asyncio.get_event_loop()
     auto_sync_controller = AutoSyncController(loop)
 
-    set_up_logging(log_location="/tmp/sync.log")
+    set_up_logging()#log_location="/tmp/sync.log")
     log.setLevel(logging.DEBUG)
     try:
         log.info("Awaiting commands.")
